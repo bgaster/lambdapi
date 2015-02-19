@@ -8,7 +8,7 @@
  *  The orginal paper describes a Haskell implementaiton and at the
  *  time of writing I was learning the basics of implementing
  *  dependetly type languages and at the same time introducing myself
- *  to Scala it seemed interesing to reimplement their work in Scala.
+ *  to Scala, hence it seemed interesing to reimplement their work in Scala.
  * 
  */
 package org
@@ -21,8 +21,14 @@ package object lambdapi {
   case class ErrorException(msg: String) extends RuntimeException(msg)
   object ErrorException {
     def create(msg: String) : ErrorException  = ErrorException(msg)
-    def create(msg: String, cause: Throwable) = ErrorException(msg).initCause(cause)
+    def create(msg: String, cause: Throwable) =
+      ErrorException(msg).initCause(cause)
   }
+
+  /*
+   *  First we define the AST representation for LambdaPI, whose
+   *  grammar is defined by the following BNF
+   */
 
   // Terms
   sealed abstract class Name
@@ -60,6 +66,27 @@ package object lambdapi {
 
   type Env = Vector[Value]
 
+  sealed abstract class Kind
+  case class Star() extends Kind
+
+  sealed abstract class Info
+  case class HasKind( k : Kind ) extends Info
+  case class HasType( t : Type ) extends Info
+
+  /*
+   *  Following in the sprit of the orignal work we support a 
+   *  simple, Gofer inspired, interpreter
+   */
+  sealed abstract class Commands
+  case class CExpr( t : TermCheck )             extends Commands
+  case class CLet( n : Name, t : TermCheck )    extends Commands
+  case class CAssume( n : Name, t : TermCheck ) extends Commands
+  case class CType( t : TermCheck )             extends Commands
+  case class CBrowse()                          extends Commands
+  case class CLoad ( filename : String )        extends Commands
+  case class CQuit ()                           extends Commands
+  case class CHelp ()                           extends Commands
+
   object Eval {
     def eval ( t : TermInfer, env : Env ) : Value =
       t match  {
@@ -75,19 +102,33 @@ package object lambdapi {
         case VNeutral(n) => VNeutral( NApp(n,v2) )
       }
 
-  def eval ( t : TermCheck, env : Env ) : Value =
+    def eval ( t : TermCheck, env : Env ) : Value =
     t match {
       case Inf(i) => eval(i, env)
       case Lam(e) => VLam ((x) => eval( e, x +: env ))
     }
+
+    def quote( v : Value ) : TermCheck = quote(0, v)
+
+    def quote( i : Int, v : Value ) : TermCheck =
+      v match {
+        case VLam(f)     => Lam( quote(i+1, f(vfree(Quote(i))) ) )
+        case VNeutral(n) => Inf( neutralQuote(i,n) )
+      }
+
+    def neutralQuote( i : Int, n : Neutral ) : TermInfer =
+      n match {
+        case NFree(x)  => boundfree(i, x)
+        case NApp(n,v) => App( neutralQuote(i, n), quote(i,v) )
+      }
+
+
+    def boundfree (i : Int, n : Name) : TermInfer =
+      n match {
+        case Quote(k) => Bound(i - k - 1)
+        case x        => Free(x)
+      }
   }
-
-  sealed abstract class Kind
-  case class Star() extends Kind
-
-  sealed abstract class Info
-  case class HasKind( k : Kind ) extends Info
-  case class HasType( t : Type ) extends Info
 
   type Result[A] = Try[A]
 
@@ -151,7 +192,11 @@ package object lambdapi {
                  else throw ErrorException.create("type mismatch")
           } yield(r)
         case (Lam(e),Fun(a,r)) =>
-          typeTerm(i+1, ((Local(i),HasType(a)) +: c), subst(0, Free(Local(i)), e), r)
+          typeTerm(
+            i+1,
+            ((Local(i),HasType(a)) +: c),
+            subst(0, Free(Local(i)), e),
+            r)
         case (_,_) =>
           throw ErrorException.create("type mismatch")
       }
@@ -171,14 +216,64 @@ package object lambdapi {
       }
   }
 
-
   object Parser extends JavaTokenParsers {
   }
 
   object Printer extends org.kiama.output.PrettyPrinter {
+    def pretty (s : Name) : String =
+      super.pretty (show (s))
+
+    def show (n : Name) : Doc =
+      n match {
+        case Local(l)  => value (l)
+        case Global(g) => value (g)
+        case Quote(i)  => value (i)
+      }
+
+    def pretty (e : TermInfer) : String =
+      super.pretty (show(0,e)._2)
+
+    def show (i : Int, e : TermInfer) : (Int, Doc) =
+      e match {
+        case Ann(e,t) => {
+          val tmp  = show(i, e)
+          (tmp._1, tmp._2 <+> ":" <+> show(t))
+        }
+        case Bound(ii) => (i, value("x" + ii.toString))
+        case Free(n)  => (i, show(n))
+        case App(lhs, rhs) =>
+          (i, parens( show(i, lhs)._2 ) <+> parens( show(i, rhs)._2 ))
+      }
+
+    def pretty (e : TermCheck) : String =
+      super.pretty (show(0,e)._2)
+
+    def show(i : Int, e : TermCheck ) : (Int, Doc) =
+      e match {
+        case Inf(t) => show(i, t)
+        case Lam(l) => {
+          val (ii,d) = show(i, l)
+          (ii+1, ("\\x" + ii.toString + ".") <+> d)
+        }
+      }
+
+    def pretty (t : Type) : String =
+      super.pretty (show (t))
+
+    def show( t : Type ) : Doc =
+      t match {
+        case TFree(n) => show(n)
+        case Fun(a,r) => show(a) <+> "->" <+> parens(show(r))
+      }
+
+    def pretty (v : Value) : String =
+      super.pretty (show (v))
+
+    def show( v : Value ) : Doc = show(0, Eval.quote(v))._2
+
   }
 
-  val id = Lam ( Inf (Bound(0)))
+  val id = Lam ( Inf( Bound(0 ) ))
   val const = Lam (Lam (Inf (Bound (1))))
   val tfree = (a : String)  => TFree (Global(a))
   val free  = (x : String ) => Inf (Free (Global(x)))
@@ -187,7 +282,7 @@ package object lambdapi {
   val env1 = Vector(
     (Global("y"), HasType(tfree("a"))),
     (Global("a"),HasKind(Star())) )
-} // package object minicl
+} // package object lambdapi
 
 object Main {
   def main ( args : Array[String] ) = {
