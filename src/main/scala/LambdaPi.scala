@@ -21,7 +21,6 @@ package object utils {
 
 package object lambdapi {
 
-//  import scala.util.parsing.combinator._
   import org.kiama.output.PrettyPrinter
   import org.kiama.attribution.Attributable
   import org.kiama.util.ParserUtilities
@@ -38,6 +37,36 @@ package object lambdapi {
   /*
    *  First we define the AST representation for LambdaPI, whose
    *  grammar is defined by the following BNF
+   *  
+   *  The term language:
+   * 
+   *     e ::= e : p                  annotated term
+   *         | *                      type of types (i.e. kind)
+   *         | Nat                    type of natural numbers
+   *         | Zero                   base case, i.e. 0, for natural numbers
+   *         | [0-9]+                 alternative numeric representation for natural numbers
+   *         | Succ (e)               the inductive case, i.e. successor of a natural number
+   *         | natElim e e e e        Eliminator for natural numbers (see McBride's paper on elimination with motive)
+   *         | forall (a : e)+ . e    dependent function space (PI)
+   *         | e -> e                 non-dependent function space
+   *         | x                      variable
+   *         | $$                     shorthand to refer to last expression evaluated in command processor
+   *         | e e                    application
+   *         | \x+ . e                lambda abstraction
+   * 
+   *  The language of values:
+   * 
+   *     v ::= n                      netural term
+   *         | *                      type of types
+   *         | Nat                    type of natural numbers
+   *         | Zero                   base case for natural numbers
+   *         | Succ (n)               inductive case for natural numbers
+   *         | forall (a : v)+ . e    dependent function space
+   *         | \x+ . v                lambda abstraction
+   * 
+   *  Note non-dependent function space is provided only as a syntatic
+   *  convience and not represented in the AST itself as it is just a
+   *  degenerate form of dependent function space
    */
 
   // Terms
@@ -54,6 +83,12 @@ package object lambdapi {
   case class Free( n : Name)                             extends TermInfer
   case class App( lhs : TermInfer, rhs : TermCheck)      extends TermInfer
 
+  // Natural numbers
+  case class Nat() extends TermInfer
+  case class Zero() extends TermInfer
+  case class Succ( n : TermCheck ) extends TermInfer
+  case class NatElim( t1 : TermCheck, t2 : TermCheck, t3 : TermCheck, t4 : TermCheck ) extends TermInfer
+
   implicit class IApp(val i: TermInfer) extends AnyVal {
     def $$(that: TermCheck) = new App(this.i, that)
   }
@@ -69,19 +104,51 @@ package object lambdapi {
   case class VPi( v : Value, f : (Value => Value) ) extends Value
   case class VNeutral ( n : Neutral )               extends Value
 
+  // Natural numbers
+  case class VNat()                                 extends Value
+  case class VZero()                                extends Value
+  case class VSucc( n : Value )                     extends Value
+
   sealed abstract class Neutral
   case class NFree ( n : Name ) extends Neutral
   case class NApp ( a : Neutral, v : Value ) extends Neutral
+  case class NNatElim ( v1: Value, v2 : Value, v3: Value, n : Neutral ) extends Neutral
 
   // create a value from a free variable
   def vfree ( n : Name ) : Value =
     VNeutral (NFree (n))
 
-    def lookup[A] ( k : Name, c : Vector[(Name,A)]) : A =
-      c match {
-        case IndexedSeq() => throw ErrorException.create("undefined identifier")
-        case a +: cs      => if (a._1 == k) a._2 else lookup(k,cs)
-      }
+  // some natural number helper functions
+  def toInt( n : Value ) : Int = n match {
+    case VZero()  => 0
+    case VSucc(n) => 1 + toInt(n)
+    case _        => throw ErrorException.create("not a number")
+  }
+
+  def canConvertToInt ( n : Value ) : Boolean = n match {
+    case VZero()  => true
+    case VSucc(n) => canConvertToInt(n)
+    case _        => false
+  }
+
+  def canConvertToInt ( n : TermInfer ) : Boolean = n match {
+    case Zero()  => true
+    case Succ(n) => canConvertToInt(n)
+    case _        => false
+  }
+
+  def canConvertToInt ( n : TermCheck ) : Boolean = n match {
+    case Inf(n)  => canConvertToInt(n)
+    case _        => false
+  }
+
+  def toNat( i : Int ) : TermInfer = if (i <= 0 ) Zero() else Succ ( Inf (toNat(i - 1)) )
+
+  def lookup[A] ( k : Name, c : Vector[(Name,A)]) : A =
+    c match {
+      case IndexedSeq() => throw ErrorException.create("undefined identifier")
+      case a +: cs      => if (a._1 == k) a._2 else lookup(k,cs)
+    }
 
   // now we define the evaluator
   type Env = (Vector[(Name,Value)], Vector[Value])
@@ -91,6 +158,24 @@ package object lambdapi {
       t match  {
         case Ann(e, t)  => eval(e, env)
         case Star()     => VStar()
+        case Zero()     => VZero()
+        case Nat()      => VNat()          
+        case Succ(n)    => VSucc( eval(n, env) )
+
+        case NatElim(m, mz, ms, k) => {
+          val mzVal  = eval(mz, env)
+          val msVal = eval(ms, env)
+
+          def rec ( kVal : Value ) : Value = kVal match {
+            case VZero()     => mzVal
+            case VSucc(l)    => vapp( vapp(msVal, l), rec(l) )
+            case VNeutral(k) => VNeutral(NNatElim(eval(m,env), mzVal, msVal, k))
+            case _           => throw ErrorException.create("should not get here")
+          }
+
+          rec (eval(k, env))
+        }
+
         case Pi(t1, t2) => VPi(eval(t1, env), (x) => eval(t2, (env._1, x +: env._2)))
         case Free(x)    => (Try(lookup(x,env._1)) recover { case _ => vfree(x) }) get
         case Bound(i)   => env._2(i)
@@ -118,12 +203,18 @@ package object lambdapi {
         case VStar()     => Inf( Star() )
         case VPi(v,f)  => Inf( Pi(quote(i, v), quote(i+1, f(vfree(Quote(i))) ) ))
         case VNeutral(n) => Inf( neutralQuote(i,n) )
+
+        case VNat()   => Inf( Nat() )
+        case VZero()  => Inf( Zero() )
+        case VSucc(n) => Inf( Succ( quote(i, n) ) )
       }
 
     def neutralQuote( i : Int, n : Neutral ) : TermInfer =
       n match {
         case NFree(x)  => boundfree(i, x)
         case NApp(n,v) => App( neutralQuote(i, n), quote(i,v) )
+        case NNatElim(m,mz,ms,k) =>
+          NatElim(quote(i,m), quote(i,mz), quote(i,ms), Inf(neutralQuote(i,k)))
       }
 
 
@@ -140,6 +231,11 @@ package object lambdapi {
   type Type = Value
   type Context = Vector[(Name,Type)]
 
+  def dummy( s : String ) : Result[Type] = {
+    println(s)
+    Success(VZero())
+  }
+
   object Typing {
 
     def typeTerm ( c : Context, t : TermInfer ) : Result[Type] =
@@ -154,6 +250,20 @@ package object lambdapi {
         } yield(t)
 
         case Star()        => Success(VStar())
+        case Nat()         => Success(VStar())
+        case Zero()        => Success(VNat())
+        case Succ(n)       => for {
+          _ <- typeTerm(i, c, n, VNat())
+        } yield(VNat())
+
+        case NatElim(m,mz,ms,k) => for {
+          _ <- typeTerm(i, c, m, VPi(VNat(), (_) => VStar()) )
+          val mVal = Eval.eval(m, (Vector(), Vector()))
+          _ <- typeTerm(i, c, mz, Eval.vapp(mVal, VZero()))
+          _ <- typeTerm(i, c, ms, VPi(VNat(), (l) => VPi(Eval.vapp(mVal,l), (_) => Eval.vapp(mVal,VSucc(l)))))
+          _ <- typeTerm(i, c, k, VNat())
+          val kVal = Eval.eval(k, (Vector(), Vector()))
+        } yield(Eval.vapp(mVal, kVal))
 
         case Pi(p1, p2)    => for {
           _ <- typeTerm(i, c, p1, VStar())
@@ -184,7 +294,7 @@ package object lambdapi {
           for {
             ty  <- typeTerm(i, c, ee)
             r <- if (Eval.quote(ty) == Eval.quote(tt)) Success()
-                 else throw ErrorException.create("type mismatch")
+                 else throw ErrorException.create("type mismatch " + ty.toString + " " + tt.toString)
           } yield(r)
         case (Lam(e),VPi(t1,t2)) =>
           typeTerm(
@@ -193,13 +303,18 @@ package object lambdapi {
             subst(0, Free(Local(i)), e),
             t2(vfree(Local(i))) )
         case (_,_) =>
-          throw ErrorException.create("type mismatch")
+          throw ErrorException.create("type mismatch " + e + " " + t)
       }
 
     def subst( i : Int, r : TermInfer, t : TermInfer ) : TermInfer =
       t match {
         case Ann(e,t)   => Ann(subst(i, r, e), subst(i, r, t))
         case Star()     => Star()
+        case Nat()      => Nat()
+        case Zero()     => Zero()
+        case Succ(n)    => Succ( subst(i,r,n) )
+        case NatElim(t1,t2,t3,t4) =>
+          NatElim( subst(i, r, t1),  subst(i, r, t2), subst(i, r, t3), subst(i, r, t4))
         case Pi(t1, t2) => Pi(subst(i, r, t1), subst(i+1, r, t2))
         case Bound(j)   => if (i == j) r else Bound(j)
         case Free(y)    => Free(y)
@@ -265,6 +380,8 @@ package object lambdapi {
     def bindings(b : Boolean, e : List[String]) :
         Parser[(List[String], List[TermCheck])] = new Bindings(b, e)
 
+    val lastStr : String = "_last"
+
     def pTermInfer ( e : List[String] ) : Parser[TermInfer] = 
      presZero(e)
 
@@ -300,10 +417,13 @@ package object lambdapi {
 
     def presTwo ( e : List[String] ) : Parser[TermInfer] =
       presThree(e) ~ rep(pTermCheckPresThree(e)) ^^ {
+        // note that we don't allow partial application of natElim, just lambdas...
+        case (Free(Global("natElim"))) ~ (t1 :: t2 :: t3 :: t4 :: ts) =>
+          ts.foldLeft(NatElim(t1,t2,t3,t4) : TermInfer) ((a,b) => a $$ b)
         case t ~ ts => ts.foldLeft(t) ((a,b) => a $$ b) } | presThree(e)
 
     def presThree ( e : List[String] ) : Parser[TermInfer] =
-       star | identifier(e) | parens( pTermInfer(e) )
+       star | nat(e) | "$$" ^^ { _ => Free(Global(lastStr)) } | identifier(e) |  parens( pTermInfer(e) )
 
     def identifier ( e : List[String] ) : Parser[TermInfer] =
       variable ^^ { v => e.indexOf(v) match {
@@ -328,6 +448,12 @@ package object lambdapi {
         }
       }
 
+    def nat( e : List[String] ) : Parser[TermInfer] =
+      "Nat" ^^ { _ => Nat() } |
+      "[0-9]+".r ^^ { n => toNat(n.toInt) } |
+      "Zero" ^^ { _ => Zero() } |
+      "Succ" ~> parens(pTermCheck(e)) ^^ { Succ }
+
     lazy val star = "*" ^^ { _ => Star() }
 
     lazy val variable : Parser[String] =
@@ -337,7 +463,7 @@ package object lambdapi {
       not (keyword) ~> "[a-zA-Z][a-zA-Z0-9]*".r
 
     lazy val keyword : Parser[String] =
-      "let" | "assume" | "forall"
+      "let" | "assume" | "forall" | "$$"
 
     def parens[A]( p : Parser[A] ) : Parser[A] =
       "(" ~> p <~ ")"
@@ -373,13 +499,13 @@ package object lambdapi {
       } yield ( c.toString ++ n )
 
 
+    // introduce a little Haskell list syntax here
     implicit class Vars(val s : Stream[String]) extends AnyVal {
       private def element(s : Stream[String], i : Int) : String =
         if (i <= 0) s.head else element(s.tail, i-1)
 
       def !!(i: Int) = element(s, i)
     }
-
 
     def show (i : Int, e : TermInfer) : (Int, Doc) =
       e match {
@@ -388,13 +514,36 @@ package object lambdapi {
           (tmp._1, tmp._2 <+> ":" <+> show(i, t)._2)
         }
         case Star() => (i, "*")
+        case Nat() => (i, "Nat")
+        case Zero() => (i, "0")
+        case Succ(n) =>
+          // special case printing complex (but "real") natural numbers
+          if (canConvertToInt(Succ(n)))
+            (i, value(toInt(Eval.eval(Succ(n), (Vector(),Vector())) )))
+          else {
+            val tmp = show(i,n)
+            (tmp._1, "Succ(" <> tmp._2 <> ")")
+          }
+    
+        case NatElim(t1,t2,t3,t4) => {
+          val tmp1 = show(i, t1)
+          val tmp2 = show(tmp1._1, t2)
+          val tmp3 = show(tmp2._1, t3)
+          val tmp4 = show(tmp3._1, t4)
+
+          (tmp4._1, "natElim" <+> parens(tmp1._2) <> " " <+> parens(tmp2._2)
+                    <> " " <+> parens(tmp3._2) <> " " <+> parens(tmp1._2))
+        }
+
         case Pi(t1, t2) => {
           val (i1, d1) = show(i, t1)
           val (i2, d2) = show(i+1,t2)
           (i2, ("forall" <+> parens((vars !! i) <+> ":" <+> d1) <+> "." <+> parens( d2 ) ))
         }
+
         case Bound(ii) => (i, vars !! (i - ii - 1))
         case Free(n)  => (i, show(n))
+
         case App(lhs, rhs) =>
           (i, parens( show(i, lhs)._2 ) <+> parens( show(i, rhs)._2 ))
       }
@@ -414,7 +563,9 @@ package object lambdapi {
     def pretty (v : Value) : String =
       super.pretty (show (v))
 
-    def show( v : Value ) : Doc = show(0, Eval.quote(v))._2
+    def show( v : Value ) : Doc =
+//      if (canConvertToInt(v)) value(toInt(v))
+      show(0, Eval.quote(v))._2
   }
 } // package object lambdapi
 
@@ -424,7 +575,13 @@ package object commands {
   import org.kiama.util.ParserUtilities
   import org.lambdapi._
 
+  // evaluation environment
   var env     : Vector[(Name,Value)] = Vector()
+
+  // the last expr evaluated and its type
+  var last    : (Value,Value) = (VNat(), VStar())
+
+  // type context
   var context : Context = Vector()
 
   /*
@@ -488,7 +645,9 @@ object Main extends org.kiama.util.ParsingREPL[org.commands.Command]
       | Any command may be abbreviated to :c where
       | c is the first character in the full name.
       |
-      | <expr>                  evaluate expression
+      | <expr>                  evaluate expression 
+      |                         ($$ refers to the last expr evaluated)
+      |
       | let <var> = <expr>      define variable
       | assume <var> :: <expr>  assume variable
       |
@@ -510,15 +669,20 @@ object Main extends org.kiama.util.ParsingREPL[org.commands.Command]
     c match {
       case CHelp()    => displayHelp()
 
-      case CExpr(e)   => org.lambdapi.Typing.typeTerm(context, e) match {
-        case scala.util.Success(t)  =>
+      case CExpr(e)   => org.lambdapi.Typing.typeTerm(
+        (org.lambdapi.Global(org.lambdapi.Parser.lastStr), last._2) +: context, e) match {
+        case scala.util.Success(t)  => {
+          val ev = org.lambdapi.Eval.eval(e,
+            ((org.lambdapi.Global(org.lambdapi.Parser.lastStr), last._1) +: env, Vector()))
+          last = (ev, t)
           println(
-            org.lambdapi.Printer.pretty(org.lambdapi.Eval.eval(e, (env, Vector()))) +
+            org.lambdapi.Printer.pretty(ev) +
             " : " +
             org.lambdapi.Printer.pretty(t)
           )
-        case scala.util.Failure(ex) => println(s"ERROR: ${ex.getMessage}")
         }
+        case scala.util.Failure(ex) => println(s"ERROR: ${ex.getMessage}")
+      }
 
       case CAssume(as) => 
         as map ( a => {
@@ -540,7 +704,7 @@ object Main extends org.kiama.util.ParsingREPL[org.commands.Command]
         }
         case scala.util.Failure(ex) => println(s"ERROR: ${ex.getMessage}")
       }
-
+ 
       case CBrowse() => {
         context.foldRight( () ) ( (c,b) =>
           println(org.lambdapi.Printer.pretty(c._1) + " : " + org.lambdapi.Printer.pretty(c._2)) )
