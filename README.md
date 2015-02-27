@@ -29,9 +29,9 @@ Run
 
 From within SBT simple type run and you will enter the REPL loop and look like this:
 
-Lambda Pi - fun with dependent types.
- Type :? for help and ^D to exit
-LP> 
+    Lambda Pi - fun with dependent types.
+      Type :? for help and ^D to exit
+    LP> 
 
 The following commands are supported:
 
